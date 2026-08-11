@@ -20,9 +20,11 @@ if (cluster.isPrimary) {
     const express = require('fulmine.js');
     const fs = require('fs');
     const zlib = require('zlib');
-    // level 1: the arena measures throughput of compressed JSON, and the payloads are small
-    // enough that a higher level buys bytes nobody counts
+    // json-comp counts the bytes twice over, rps * (minBpr/myBpr)^2, so brotli is preferred where
+    // the client offers it: q3 is 12% smaller than gzip level 1 here for 24us more per request.
+    // Gzip stays for a client that asks only for gzip, where the level is not worth the CPU.
     const GZIP_OPTS = { level: 1 };
+    const BROTLI_OPTS = { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 3 } };
 
     const app = express();
     app.disable('x-powered-by');
@@ -164,14 +166,14 @@ if (cluster.isPrimary) {
             const body = JSON.stringify({ items, count });
             // json-comp profile: negotiated per request, nothing without Accept-Encoding
             const ae = req.headers['accept-encoding'] || '';
-            if (ae.includes('gzip')) {
+            if (ae.includes('br')) {
+                res.set({ ...SERVER_HDR, 'content-encoding': 'br' })
+                    .type('application/json')
+                    .send(zlib.brotliCompressSync(body, BROTLI_OPTS));
+            } else if (ae.includes('gzip')) {
                 res.set({ ...SERVER_HDR, 'content-encoding': 'gzip' })
                     .type('application/json')
                     .send(zlib.gzipSync(body, GZIP_OPTS));
-            } else if (ae.includes('br')) {
-                res.set({ ...SERVER_HDR, 'content-encoding': 'br' })
-                    .type('application/json')
-                    .send(zlib.brotliCompressSync(body, { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 3 } }));
             } else {
                 res.set(SERVER_HDR).type('application/json').send(body);
             }
@@ -336,7 +338,9 @@ if (cluster.isPrimary) {
         }
     });
 
-    app.get('/static/:filename', (req, res) => {
+    // shared by the plaintext listener and the TLS one on 8081, as the JSON route is: static-tls
+    // asks for the same files over TLS
+    const registerStaticRoute = (target) => target.get('/static/:filename', (req, res) => {
         const sf = staticFiles[req.params.filename];
         if (!sf) return res.status(404).send('Not found');
         const ae = req.headers['accept-encoding'] || '';
@@ -356,6 +360,7 @@ if (cluster.isPrimary) {
             res.set(headers).send(buf);
         });
     });
+    registerStaticRoute(app);
 
     // WebSocket echo profiles, on µWS's own WebSocket server through the app's uwsApp handle.
     // Every connection performs µWS's real upgrade handshake; the echo hands the incoming
@@ -368,8 +373,8 @@ if (cluster.isPrimary) {
         }
     });
 
-    // json-tls profile: the same JSON route over uWS's native TLS on 8081. The certs are
-    // mounted by the harness for the TLS profiles; without them there is simply no listener.
+    // json-tls and static-tls profiles: the same two routes over uWS's native TLS on 8081. The
+    // certs are mounted by the harness for the TLS profiles; without them there is no listener.
     if (fs.existsSync('/certs/server.key') && fs.existsSync('/certs/server.crt')) {
         const tlsApp = express({
             uwsOptions: {
@@ -380,6 +385,7 @@ if (cluster.isPrimary) {
         tlsApp.disable('x-powered-by');
         tlsApp.set('etag', false);
         registerJsonRoute(tlsApp);
+        registerStaticRoute(tlsApp);
         tlsApp.listen(8081);
     }
 
