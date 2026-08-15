@@ -560,6 +560,14 @@
     "engine": "hummingbird",
     "mode": "tuned"
   },
+  "hyper-express": {
+    "dir": "hyper-express",
+    "description": "hyper-express (Express-like API on uWebSockets.js) with the cluster module for multi-core scaling.",
+    "repo": "https://github.com/kartikk221/hyper-express",
+    "type": "emerging",
+    "engine": "uwebsockets",
+    "mode": "tuned"
+  },
   "hyper": {
     "dir": "hyper",
     "description": "Low-level HTTP library for Rust, built on tokio with multi-threaded async runtime.",
