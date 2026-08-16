@@ -2039,13 +2039,17 @@ def _fw_body(fw, m, lang, ranks, runs, round_name, lang_url=""):
 def _fw_page(fw, m, lang, ranks, runs, round_name, og_url, lang_url=""):
     e = _html.escape
     url = SITE + _fw_url(fw)
-    title = f"{fw} benchmark results"
+    title = f"{fw} performance benchmark & ranking"
     # the main family when the entry runs it, its first one otherwise. Quoting
     # whichever rank happens to be best would read as picked, and be picked
     lead = next((r for r in ranks if r[0] == DEFAULT_SCOPE), ranks[0] if ranks else None)
-    desc = (f"{fw}" + (f" ({lang})" if lang else "") + " in the HttpArena benchmark: "
-            + (f"ranked {lead[1]} of {lead[2]} on {SCOPE_NAME[lead[0]]}, " if lead else "")
-            + f"throughput, latency, CPU and memory over {len(runs)} runs on the same machine.")
+    # "web framework" vs "HTTP server" mirrors the wording the lang pages use,
+    # so a search snippet for this entry and for its language list read as the
+    # same vocabulary rather than two different ways of describing one thing.
+    kind_word = "web framework" if kind_has_mode(m.get("type", "emerging")) else "HTTP server"
+    desc = (f"{fw}" + (f" ({lang})" if lang else "") + f" {kind_word} performance: "
+            + (f"ranked {lead[1]} of {lead[2]} in HttpArena, " if lead else "benchmarked in HttpArena, ")
+            + f"compared on throughput, latency, CPU and memory over {len(runs)} runs.")
     graph = [
         {"@type": "WebPage", "@id": url + "#page", "name": title, "description": desc,
          "url": url, "inLanguage": "en", "isPartOf": {"@id": SITE + "/#website"},
@@ -2169,21 +2173,18 @@ def _lang_page(lang, scopes, all_entries, round_name):
     """
     e = _html.escape
     url = SITE + _lang_url(lang)
-    title = lang + " web framework benchmarks"
+    title = lang + " web framework benchmarks: performance comparison"
     n = len(all_entries)
-    fams = ", ".join(SCOPE_NAME[s] for s in scopes)
     faq = _lang_faq(lang, scopes, n, round_name)
     lead_row = (scopes.get(DEFAULT_SCOPE) or (next(iter(scopes.values())) if scopes else None))
-    lead_fw = lead_row[0][0] if lead_row else ""
-    # Description leads with the answer rather than describing the page: it is
-    # the search snippet, and the first line an assistant reads.
-    desc = ((f"The fastest {lang} "
-             + ("web framework" if kind_has_mode(lead_row[0][1]) else "HTTP server")
-             + f" in HttpArena is {lead_fw} "
-               f"(composite {lead_row[0][3]:.0f} on {SCOPE_NAME[DEFAULT_SCOPE]}). "
-             if lead_row else "")
-            + f"All {n} {lang} entr{'y' if n == 1 else 'ies'} compared on {fams}: "
-              f"composite score, rank overall and rank among {lang}.")
+    # Kept short on purpose: this is the search-snippet and og:description, not
+    # the page. The composite-score sentence with its numbers belongs to the
+    # on-page "answer" paragraph below, which a reader (or an assistant) reaches
+    # after clicking through; stuffing that detail into the tag just makes the
+    # snippet unreadable.
+    desc = (f"Which {lang} web framework is fastest? See the full list of {n} "
+            f"{lang} web frameworks and HTTP servers, compared by performance "
+            f"in a composite score table.")
 
     tables = []
     for scope, rows in scopes.items():
@@ -2303,9 +2304,10 @@ def _fw_index_page(entries, lang_pages=()):
     makes every framework page reachable by following links from the board."""
     e = _html.escape
     url = SITE + "/frameworks/"
-    title = "Every framework in the benchmark"
-    desc = (f"All {len(entries)} frameworks, HTTP engines and reverse proxies measured by "
-            "HttpArena, with a results page each.")
+    title = "Web framework & HTTP server benchmarks: full list"
+    desc = (f"Browse the full list of {len(entries)} web frameworks, HTTP engines "
+            "and reverse proxies benchmarked by HttpArena, compared by language "
+            "and performance.")
     by_lang = {}
     for fw, lang, kind in entries:
         by_lang.setdefault(lang or "Other", []).append((fw, kind))
