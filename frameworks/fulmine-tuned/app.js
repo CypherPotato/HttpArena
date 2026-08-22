@@ -24,17 +24,21 @@ function getCPUCount() {
 
 const express = require('fulmine.js');
 const fs = require('fs');
-const zlib = require('zlib');
 
-// The framework's own compression middleware, which negotiates br and gzip per request and
-// takes the compression module's options. json-comp counts the bytes twice over,
-// rps * (minBpr/myBpr)^2, so brotli is worth its extra microseconds where the client offers
-// it: q3 is 12% smaller than gzip level 1 here. Mounted on the json route rather than on the
-// app, because that is the only route the profiles ask to compress.
-const compress = express.compression({
-    level: 1,
-    brotli: { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 3 } }
-});
+// The framework's own compression middleware, mounted on the json route rather than on the app,
+// because that is the only route the profiles ask to compress.
+//
+// gzip and not brotli, which is a reversal, and it is 5.18.0 that reverses it: a whole body is
+// now gzipped on a stream the framework keeps rather than on one built and thrown away per call,
+// which is half of what the call used to cost at this size. A brotli stream cannot be kept that
+// way, it carries context from one body into the next, so it still pays the build every time.
+// json-comp scores rps * (minBpr/myBpr)^2, so brotli's 10% smaller body is worth roughly a fifth
+// of the score and the cheaper call is worth more than that. `encodings` is the documented way to
+// say it: the client offers both and gets gzip.
+//
+// Level 3 rather than 1: once the per-call build is gone, levels 1, 2 and 3 cost the same, and 3
+// is the smallest of them.
+const compress = express.compression({ level: 3, encodings: ['gzip'] });
 
 // 'auto' is one worker per usable core, and usable means the cgroup quota where there is one: a
 // container with two cores does not fork sixty-four processes because the host has them.
@@ -93,7 +97,12 @@ if (dbUrl) {
         // The pool is kept to one connection, the tag's overflow for a stalled pipeline, so
         // the connection budget stays perWorker + 1.
         const pool = new Pool({ connectionString: dbUrl, max: 1 });
-        sql = require('pg-telaio').createSql(pool, { pipeline: perWorker });
+        // stallMillis false turns off the tag's slow-query guard, which parks a connection that
+        // has stopped answering and sends its queries to the pool. Every query these profiles
+        // run is a point read of a few milliseconds, so the guard can only cost here: measured
+        // 5% to 12% at this shape. It stays on by default for a mixed workload, where one slow
+        // query would otherwise hold up the fast ones queued behind it.
+        sql = require('pg-telaio').createSql(pool, { pipeline: perWorker, stallMillis: false });
         pgPool = pool;
     } catch (e) {}
 }
@@ -160,12 +169,18 @@ const registerJsonRoute = (target, path = '/json/:count') => target.get(path, co
         if (count < 0) count = 0;
         if (count > datasetItems.length) count = datasetItems.length;
         const m = parseInt(req.query.m) || 1;
-        const items = datasetItems.slice(0, count).map(d => ({
-            id: d.id, name: d.name, category: d.category,
-            price: d.price, quantity: d.quantity, active: d.active,
-            tags: d.tags, rating: d.rating,
-            total: d.price * d.quantity * m
-        }));
+        // a preallocated loop, not slice().map(): same items, without the sliced
+        // copy and the per-element callback
+        const items = new Array(count);
+        for (let i = 0; i < count; i++) {
+            const d = datasetItems[i];
+            items[i] = {
+                id: d.id, name: d.name, category: d.category,
+                price: d.price, quantity: d.quantity, active: d.active,
+                tags: d.tags, rating: d.rating,
+                total: d.price * d.quantity * m
+            };
+        }
         // the middleware compresses this when the request asked for it, and leaves it alone
         // when it did not: the json profile sends no Accept-Encoding, json-comp sends one
         //
@@ -190,7 +205,9 @@ app.get('/fortunes', async (req, res) => {
     if (!pgPool) return res.status(500).type('text/plain').send('DB not available');
     try {
         const result = await sql`SELECT id, message FROM fortune`;
-        const rows = result.rows.map(r => ({ id: r.id, message: r.message }));
+        // the driver rows already carry only id and message, so the runtime row is
+        // pushed onto them and they are sorted in place instead of copied first
+        const rows = result.rows;
         rows.push({ id: 0, message: RUNTIME_FORTUNE });
         // ordinal, not locale aware: the synthetic rows carry em-dashes, and localeCompare
         // would order them by collation rules the profile does not ask for
