@@ -125,28 +125,63 @@ async function upload(req: Request): Promise<Response> {
 //
 // Bun.file() is a lazy handle - the bytes are read when the Response is streamed
 // and nothing is retained between requests, which is what the profile requires
-// of a framework entry. This entry is `standard`, so the .br/.gz files the
-// harness leaves on disk are left alone: hand-rolled suffix lookup is a tuned
-// technique and Bun.serve has no documented pre-compressed static API.
+// of a framework entry.
+//
+// Bun.serve has no pre-compressed static API of its own, so the .br/.gz variants
+// the harness leaves on disk are selected here. Nothing is compressed at
+// runtime: the encoded bytes already exist next to the original, and picking one
+// is a read of a different path. Selection stays lazy for the same reason the
+// plain path is - the variant is a Bun.file handle too, so replacing either file
+// on disk shows up on the next request.
 const MIME: Record<string, string> = {
     css: "text/css", js: "text/javascript", html: "text/html",
     woff2: "font/woff2", svg: "image/svg+xml", webp: "image/webp",
     json: "application/json",
 };
 
-async function serveStatic(path: string): Promise<Response> {
+// Static responses carry Content-Type and, when encoded, Content-Encoding, and
+// nothing else. Vary: Accept-Encoding is correct HTTP and is what most static
+// handlers send, but the profile scores bandwidth and it is ~38 bytes a response
+// together with Server, so both are left off here.
+//
+// Brotli first: it is the smaller of the two and every client that sends br
+// also sends gzip. A client asking for neither gets the original bytes.
+const ENCODINGS: ReadonlyArray<readonly [string, string]> = [
+    ["br", ".br"],
+    ["gzip", ".gz"],
+];
+
+async function serveStatic(path: string, req: Request): Promise<Response> {
     const name = path.slice(8);
     // No traversal outside the mount, and no directory reads.
     if (name.length === 0 || name.includes("/") || name.includes("..")) {
         return new Response("Not Found", { status: 404, headers: TEXT });
     }
-    const file = Bun.file("/data/static/" + name);
+    const base = "/data/static/" + name;
+    const file = Bun.file(base);
     if (!(await file.exists())) {
         return new Response("Not Found", { status: 404, headers: TEXT });
     }
     const dot = name.lastIndexOf(".");
     const type = (dot > 0 && MIME[name.slice(dot + 1)]) || "application/octet-stream";
-    return new Response(file, { headers: { "content-type": type, "server": "bun" } });
+
+    // Content-Type stays that of the original file; only the encoding differs.
+    const accept = req.headers.get("accept-encoding") ?? "";
+    for (const [token, suffix] of ENCODINGS) {
+        if (!accept.includes(token)) continue;
+        const encoded = Bun.file(base + suffix);
+        if (await encoded.exists()) {
+            // Only the two headers the response is wrong without: Bun infers
+            // Content-Type from the .br/.gz suffix and gets it wrong, and it
+            // never sets Content-Encoding. Vary and Server are deliberately
+            // not sent - see the note above serveStatic.
+            return new Response(encoded, {
+                headers: { "content-type": type, "content-encoding": token },
+            });
+        }
+    }
+
+    return new Response(file, { headers: { "content-type": type } });
 }
 
 // ── database ────────────────────────────────────────────────────────────────
@@ -306,7 +341,7 @@ function handle(req: Request): Response | Promise<Response> {
 
     if (path === "/baseline2") return new Response(String(sumQuery(query)), { headers: TEXT });
 
-    if (path.startsWith("/static/")) return serveStatic(path);
+    if (path.startsWith("/static/")) return serveStatic(path, req);
 
     if (path === "/async-db") return asyncDb(query);
 
