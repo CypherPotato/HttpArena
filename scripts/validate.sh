@@ -10,6 +10,10 @@ H1TLS_PORT=8081
 H2C_PORT=8082
 PASS=0
 FAIL=0
+# Set by the TLS probes; written out at the end so the board can show which
+# entries have actually been checked rather than trusting a self-declared flag.
+TLS_CHECKED=false
+TLS_CLEAN=true
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR/.."
@@ -86,8 +90,10 @@ dump_stack_logs() {
     done
 }
 
-# 5-minute overall timeout
-VALIDATE_TIMEOUT=${VALIDATE_TIMEOUT:-300}
+# Overall watchdog. 300s was not enough for the entries with the widest
+# profile sets once the TLS probes joined -- humming-bird and the
+# web-framework-* trio were killed mid-run rather than failing anything.
+VALIDATE_TIMEOUT=${VALIDATE_TIMEOUT:-800}
 ( trap 'exit 0' TERM; sleep "$VALIDATE_TIMEOUT"; echo ""; echo "FAIL: Validation timed out after ${VALIDATE_TIMEOUT}s"; dump_logs "$CONTAINER_NAME" "$FRAMEWORK"; kill -TERM $$ 2>/dev/null ) &
 WATCHDOG_PID=$!
 
@@ -201,9 +207,14 @@ if has_test "gateway-64" || has_test "gateway-h3"; then
     docker_args+=(-v "$DATA_DIR/dataset-large.json:/data/dataset-large.json:ro")
 fi
 
-if has_test "static" || has_test "static-tls" || has_test "static-h2" || has_test "static-h3" || has_test "gateway-64" || has_test "gateway-h3" || has_test "production-stack"; then
-    docker_args+=(-v "$DATA_DIR/static:/data/static:ro")
-fi
+# Mounted for every entry, not only the ones with a static profile, which is
+# what benchmark.sh already does (scripts/lib/framework.sh). Entries that read
+# the directory at startup -- rage and rails copy it, userver builds an
+# fs-cache from it -- cannot boot without it, so dropping the mount when the
+# static profiles are not subscribed turned "this entry does not serve static"
+# into "this entry does not start". It is a read-only bind of a small
+# directory; there is nothing to be gained by leaving it out.
+docker_args+=(-v "$DATA_DIR/static:/data/static:ro")
 
 # Note: --security-opt seccomp=unconfined is applied unconditionally in both
 # container-launch branches above. io_uring (and other syscalls some runtimes
@@ -557,6 +568,179 @@ static_staleness_probe() {
         fail_with_link "[$label]: $target was replaced in the mounted static directory (along with its .br/.gz twins) and the server still served the same bytes after ${STATIC_STALE_WINDOW}s. Either a cache is holding the contents and never revalidating, or the entry is serving a copy taken at image build rather than the directory the profile mounts" "$docs"
     else
         fail_with_link "[$label]: the replaced file was served, but the original did not come back within ${STATIC_STALE_WINDOW}s" "$docs"
+    fi
+}
+
+# ───── TLS quality ─────
+#
+# The posture probe below asks what this connection negotiated. This asks what
+# the server is willing to negotiate at all, which is a different question and
+# the one that says whether an entry's TLS defaults are any good: a server can
+# hand a modern client TLS 1.3 and still accept TLS 1.0 or a NULL cipher from
+# anything else that asks.
+#
+# Asked with openssl directly rather than with a scanner. testssl.sh is the
+# reference tool for this and agrees with these results -- it is what found
+# the first real failure here -- but a gate that runs on every entry wants no
+# image to pull and no scanner to hang: these probes take ~70ms for the whole
+# set against testssl's ~5s, and nothing outside the base image is needed.
+# testssl.sh remains the better tool for an audit, where its far wider suite
+# coverage and its SSL Labs style grade are worth the time.
+#
+# The client has to be pushed to make these offers at all: OpenSSL 3 will not
+# send an SSLv3 or TLS 1.0 ClientHello, nor a NULL/EXPORT/RC4 one, at its
+# default security level. @SECLEVEL=0 is what makes the question askable.
+#
+# A protocol or cipher counts as accepted only when a handshake actually
+# completes. An alert, a reset or a timeout is a refusal.
+_tls_accepts() {
+    local port="$1" proto="$2" cipher="${3:-}"
+    # A flag this openssl was not built with cannot be probed; say so rather
+    # than reading "cannot ask" as "refused".
+    if ! openssl s_client -help 2>&1 | grep -q -- "-${proto} "; then
+        echo "unsupported"
+        return 0
+    fi
+    if timeout 8 openssl s_client -connect "localhost:$port" "-${proto}" \
+           ${cipher:+-cipher "$cipher"} </dev/null 2>/dev/null \
+       | grep -qE "^New, (TLSv1|SSLv3)"; then
+        echo "yes"
+    else
+        echo "no"
+    fi
+}
+
+tls_quality_probe() {
+    local label="$1" port="$2" docs="$3"
+    TLS_CHECKED=true
+
+    local old="" untestable=""
+    local proto
+    for proto in ssl3 tls1 tls1_1; do
+        case "$(_tls_accepts "$port" "$proto" 'ALL:@SECLEVEL=0')" in
+            yes)         old="$old ${proto}" ;;
+            unsupported) untestable="$untestable ${proto}" ;;
+        esac
+    done
+
+    # Cipher families that are broken on their own terms: no encryption, no
+    # authentication, export-grade, or 64-bit.
+    local weak="" fam
+    for fam in NULL aNULL EXPORT RC4 DES 3DES; do
+        [ "$(_tls_accepts "$port" tls1_2 "${fam}:@SECLEVEL=0")" = "yes" ] && weak="$weak ${fam}"
+    done
+
+    if [ -n "$old" ] || [ -n "$weak" ]; then
+        TLS_CLEAN=false
+        local detail=""
+        [ -n "$old" ]  && detail="obsolete protocols:${old}"
+        [ -n "$weak" ] && detail="${detail:+$detail; }weak ciphers:${weak}"
+        fail_with_link "[$label TLS quality]: the server completes a handshake using $detail. A client that asks for these gets them, whatever a modern client negotiates" "$docs"
+    else
+        echo "  PASS [$label TLS quality] (refuses every obsolete protocol and weak cipher probed)"
+        PASS=$((PASS + 1))
+    fi
+    [ -n "$untestable" ] && echo "  NOTE [$label TLS quality]: this openssl cannot offer${untestable}, so those were not probed"
+    return 0
+}
+
+# ───── TLS posture ─────
+#
+# Until now the only thing checked about TLS was which protocol ALPN settled
+# on. Everything else that makes one entry's TLS cheaper than another's went
+# unmeasured, and two of those are worth real throughput:
+#
+#   * the certificate. The harness mounts an RSA-2048 pair, and every TLS
+#     handshake costs the server one signature with it. On this box RSA-2048
+#     signs 3,052/s against 77,124/s for ECDSA P-256 -- 25x. An entry that
+#     quietly generates its own EC certificate instead of using the mounted
+#     one gets that, and nothing here would have noticed.
+#   * the cipher. In TLS 1.3 the server picks, and the field is already split:
+#     some entries choose AES-128-GCM, some AES-256-GCM, which measures ~17%
+#     apart on bulk encryption at static-file block sizes. That is reported
+#     rather than failed -- not every framework exposes cipher preference --
+#     but it is on the record instead of invisible.
+#
+# openssl s_client rather than a scanner: this needs a handful of facts about
+# what the server negotiated, in about 50ms per port. A full TLS audit spends
+# minutes per host on vulnerability probes that say nothing about whether two
+# benchmark numbers are comparable.
+#
+# $1 label prefix  $2 port  $3 docs url  $4 expected ALPN (empty to skip)
+tls_posture_probe() {
+    local label="$1" port="$2" docs="$3" want_alpn="${4:-}"
+    TLS_CHECKED=true
+
+    local expected_fp
+    expected_fp=$(openssl x509 -in "$CERTS_DIR/server.crt" -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//')
+    if [ -z "$expected_fp" ]; then
+        echo "  SKIP [$label TLS posture] (cannot read $CERTS_DIR/server.crt)"
+        return 0
+    fi
+
+    local out
+    out=$(timeout 10 openssl s_client -connect "localhost:$port" -servername localhost \
+              ${want_alpn:+-alpn "$want_alpn"} </dev/null 2>/dev/null)
+    if [ -z "$out" ]; then
+        fail_with_link "[$label TLS posture]: no TLS handshake completed on port $port" "$docs"
+        return 0
+    fi
+
+    # 1. The served certificate must be the one the harness mounted.
+    local served_fp
+    served_fp=$(printf '%s' "$out" | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//' || true)
+    if [ "$served_fp" = "$expected_fp" ]; then
+        echo "  PASS [$label serves the mounted certificate]"
+        PASS=$((PASS + 1))
+    else
+        local alg
+        alg=$(printf '%s' "$out" | openssl x509 -noout -text 2>/dev/null \
+              | grep -m1 "Public Key Algorithm" | sed 's/.*: //' || true)
+        TLS_CLEAN=false
+        fail_with_link "[$label serves the mounted certificate]: the certificate on port $port is not the one mounted at /certs (served ${alg:-unknown key}, fingerprint ${served_fp:-none}). Every handshake is signed with this key, so a self-generated one -- an EC key above all -- makes handshakes cheaper than they are for every other entry" "$docs"
+    fi
+
+    # 2. TLS 1.3, when the client offered it.
+    local new_line version cipher
+    new_line=$(printf '%s' "$out" | grep -m1 "^New, " || true)
+    version=$(printf '%s' "$new_line" | awk -F', ' '{print $2}')
+    cipher=$(printf '%s' "$new_line" | sed 's/.*Cipher is //')
+    if [ "$version" = "TLSv1.3" ]; then
+        echo "  PASS [$label negotiates TLS 1.3] (cipher $cipher)"
+        PASS=$((PASS + 1))
+    else
+        TLS_CLEAN=false
+        fail_with_link "[$label negotiates TLS 1.3]: settled on ${version:-unknown} against a client offering 1.3. The 1.2 handshake costs an extra round trip, so its numbers are not comparable with the rest of the field" "$docs"
+    fi
+
+    # 3. A real AEAD. Catches NULL, anon, export and RC4 suites, which would
+    #    make "TLS" free.
+    case "$cipher" in
+        TLS_AES_128_GCM_SHA256|TLS_AES_256_GCM_SHA384|TLS_CHACHA20_POLY1305_SHA256)
+            echo "  PASS [$label uses a TLS 1.3 AEAD cipher] ($cipher)"
+            PASS=$((PASS + 1)) ;;
+        *)
+            TLS_CLEAN=false
+            fail_with_link "[$label uses a TLS 1.3 AEAD cipher]: negotiated '${cipher:-none}', which is not one of the three TLS 1.3 suites" "$docs" ;;
+    esac
+
+    # 4. ALPN must never name a protocol the client did not offer. Selecting
+    #    nothing is allowed and common -- a server without ALPN omits the
+    #    extension and the client falls back, which is fine on the HTTP/1.1
+    #    ports. Whether the right protocol actually gets used is already
+    #    checked functionally by each profile's own negotiation test; what is
+    #    checked here is that the server does not answer with something else,
+    #    which would silently measure a different protocol than the profile
+    #    names.
+    if [ -n "$want_alpn" ]; then
+        local got_alpn
+        got_alpn=$(printf '%s' "$out" | grep -m1 "^ALPN protocol:" | sed 's/.*: *//' || true)
+        if [ -z "$got_alpn" ] || [ "$got_alpn" = "$want_alpn" ]; then
+            echo "  PASS [$label ALPN] (${got_alpn:-none negotiated, client falls back})"
+            PASS=$((PASS + 1))
+        else
+            fail_with_link "[$label ALPN]: the client offered only $want_alpn and the server selected '$got_alpn'" "$docs"
+        fi
     fi
 }
 
@@ -1039,6 +1223,8 @@ fi
 
 if has_test "json-tls"; then
     JSONTLS_DOCS="$DOCS_BASE/h1/isolated/json-tls/validation"
+    tls_posture_probe "json-tls" "$H1TLS_PORT" "$JSONTLS_DOCS" "http/1.1"
+    tls_quality_probe "json-tls" "$H1TLS_PORT" "$JSONTLS_DOCS"
     echo "[test] json-tls endpoint"
 
     # Must negotiate HTTP/1.1 (not h2) via ALPN on :8081
@@ -1184,6 +1370,8 @@ fi
 
 if has_test "baseline-h2"; then
     H2_DOCS="$DOCS_BASE/h2/baseline-h2/validation"
+    tls_posture_probe "baseline-h2" "$H2PORT" "$H2_DOCS" "h2"
+    tls_quality_probe "baseline-h2" "$H2PORT" "$H2_DOCS"
     echo "[test] baseline-h2 endpoint"
     if wait_h2; then
         # Verify server actually speaks HTTP/2
@@ -1410,6 +1598,7 @@ fi
 
 if has_test "static-tls"; then
     STATICTLS_DOCS="$DOCS_BASE/h1/isolated/static-tls/validation"
+    tls_posture_probe "static-tls" "$H1TLS_PORT" "$STATICTLS_DOCS" "http/1.1"
     echo "[test] static-tls endpoint"
 
     # Must negotiate HTTP/1.1 (not h2) via ALPN on :8081
@@ -1493,6 +1682,7 @@ fi
 
 if has_test "static-h2"; then
     STATIC_H2_DOCS="$DOCS_BASE/h2/static-h2/validation"
+    tls_posture_probe "static-h2" "$H2PORT" "$STATIC_H2_DOCS" "h2"
     echo "[test] static-h2 endpoint"
     if wait_h2; then
         # Check a few static files exist and return correct Content-Type
@@ -2329,6 +2519,23 @@ if has_test "production-stack"; then
 fi
 
 # ───── Summary ─────
+
+# Record the TLS verdict where the board can read it. Only written when the
+# entry actually has TLS profiles, and only ever says "pass" because the checks
+# ran and were clean -- absence means unverified, never approved. This is why
+# it is a generated artifact rather than a meta.json field: the shield has to
+# be earned by the probes, not declared by the entry.
+if [ "$TLS_CHECKED" = "true" ]; then
+    mkdir -p "$ROOT_DIR/site/data/tls"
+    if [ "$TLS_CLEAN" = "true" ] && [ "$FAIL" -eq 0 ]; then
+        tls_state="pass"
+    else
+        tls_state="fail"
+    fi
+    printf '{\n  "framework": "%s",\n  "tls": "%s"\n}\n' \
+        "$FRAMEWORK" "$tls_state" > "$ROOT_DIR/site/data/tls/$FRAMEWORK.json"
+    echo "[info] TLS verdict: $tls_state (site/data/tls/$FRAMEWORK.json)"
+fi
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

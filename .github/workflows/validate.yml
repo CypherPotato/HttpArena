@@ -49,11 +49,18 @@ jobs:
           #     frameworks/ paths, so it validates nothing at all -- which is
           #     what happened to the static staleness probe when it landed.
           #   * otherwise, just the entries the PR touches
+          # The trailing `return 0` matters: the loop's last command is a jq
+          # that exits non-zero for a disabled entry, so without it the
+          # function inherits that status and `changed=$(all_entries)` aborts
+          # the whole step under `bash -e` -- silently, before anything is
+          # echoed. Whether that happens depends on which entry sorts last and
+          # whether it is enabled, which is not a thing to leave to chance.
           all_entries() {
             for m in frameworks/*/meta.json; do
               fw=$(basename "$(dirname "$m")")
               jq -e '.enabled != false' "$m" >/dev/null 2>&1 && echo "$fw"
             done
+            return 0
           }
 
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -110,6 +117,21 @@ jobs:
       - uses: actions/checkout@v5
       - name: Validate ${{ matrix.framework }}
         run: ./scripts/validate.sh "${{ matrix.framework }}"
+
+      # validate.sh writes site/data/tls/<entry>.json when it runs the TLS
+      # probes, and the board turns that into the TLS shield. Nothing here
+      # commits it -- one artifact per entry, collected after the run, keeps
+      # 177 parallel jobs from racing each other over one directory. Uploaded
+      # even when validation failed, because a TLS verdict of "fail" is a
+      # result worth having.
+      - name: Collect TLS verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-verdict-${{ matrix.framework }}
+          path: site/data/tls/
+          if-no-files-found: ignore
+          retention-days: 7
 
   validate-gateway:
     needs: detect

@@ -3450,7 +3450,11 @@ def main():
                 "dir": m.get("dir", ""),
                 "engine": m.get("engine", ""),
                 "cmp": m.get("completeness"),
-                "desc": m.get("description", "")} for n, m in frameworks.items()}
+                "desc": m.get("description", ""),
+                # Only ever set when the probes ran and were clean. Absent
+                # means unverified, which the board renders as no shield
+                # rather than as a failure.
+                } for n, m in frameworks.items()}
 
     docs_tree, docs_content = build_docs()
 
