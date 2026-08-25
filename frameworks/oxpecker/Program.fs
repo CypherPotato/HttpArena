@@ -3,20 +3,15 @@ module HttpArena.Program
 open System
 open System.IO
 open System.Security.Cryptography.X509Certificates
-open System.Threading.Tasks
-
-open HttpArena.Services
-
 open Microsoft.AspNetCore.Builder
 open Microsoft.AspNetCore.Hosting
 open Microsoft.AspNetCore.Http
 open Microsoft.AspNetCore.Server.Kestrel.Core
+open Microsoft.AspNetCore.StaticFiles
 open Microsoft.Extensions.DependencyInjection
 open Microsoft.Extensions.FileProviders
 open Microsoft.Extensions.Hosting
 open Microsoft.Extensions.Logging
-open Microsoft.Extensions.Primitives
-
 open Oxpecker
 
 
@@ -100,36 +95,35 @@ let main args =
 
     let app = builder.Build()
 
-    // The Services modules hold their state in module-level bindings, which
-    // .NET initializes on first touch. Reading them here loads the dataset and
-    // opens the Postgres/Redis pools at startup instead of during the first
-    // request — and turns a missing dataset or DATABASE_URL into a startup
-    // message rather than mystery 500s.
-    if not Dataset.isAvailable then
-        Console.Error.WriteLine "dataset not loaded; /json will answer 500"
-
-    if not Database.isAvailable then
-        Console.Error.WriteLine "DATABASE_URL not configured; DB endpoints will answer 500"
-
     app.UseResponseCompression() |> ignore
 
-    // Static assets are served straight off the mounted directory by ASP.NET
-    // Core's static file middleware — every request reads the file from disk,
-    // and the response compression middleware above handles the compressible
-    // types. Registered before routing so /static/* never reaches Oxpecker,
-    // while a missing file falls through to the router's 404.
-    let staticRoot = envPath "STATIC_PATH" "/data/static"
+    // Served straight out of the directory the profile mounts, rather than a
+    // copy taken at image build. MapStaticAssets, which this used before,
+    // resolves assets through a manifest the SDK generates at publish time from
+    // wwwroot, so the container held two copies of the corpus and answered from
+    // the one the harness cannot touch: replacing a file in the mounted
+    // directory never reached a response.
+    //
+    // UseStaticFiles reads the file per request through the file provider, so
+    // what is served follows the mounted directory. Compression stays with the
+    // response compression middleware registered above.
+    let staticContentTypes = FileExtensionContentTypeProvider()
+    staticContentTypes.Mappings[".webp"] <- "image/webp"
+    staticContentTypes.Mappings[".woff2"] <- "font/woff2"
 
-    if Directory.Exists staticRoot then
-        app.UseStaticFiles(
-            StaticFileOptions(
-                FileProvider = new PhysicalFileProvider(staticRoot),
-                RequestPath = PathString "/static"
-            )
+    app.UseStaticFiles(
+        StaticFileOptions(
+            FileProvider = new PhysicalFileProvider("/data/static"),
+            RequestPath = PathString "/static",
+            ContentTypeProvider = staticContentTypes,
+            ServeUnknownFileTypes = false
         )
-        |> ignore
+    )
+    |> ignore
 
-    app.UseRouting().UseOxpecker(endpoints) |> ignore
+    app.UseRouting() |> ignore
+
+    app.UseOxpecker endpoints |> ignore
 
     app.Run()
     0

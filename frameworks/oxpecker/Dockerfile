@@ -1,6 +1,10 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /app
-COPY . .
+COPY frameworks/oxpecker/ .
+# Drop any host build output that came along with the copy; the SDK image has
+# to restore for linux-x64 itself.
+RUN rm -rf bin obj
+
 RUN dotnet publish -c Release -o out
 
 FROM mcr.microsoft.com/dotnet/aspnet:10.0
