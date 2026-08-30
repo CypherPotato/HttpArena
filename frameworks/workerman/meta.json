@@ -19,7 +19,7 @@
     "limited-conn",
     "json-tls",
     "async-db",
-    "upload"
+    "echo-10k"
   ],
   "maintainers": [
     "joanhey"

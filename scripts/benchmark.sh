@@ -166,12 +166,12 @@ $_has_isolated_test && framework_build
 # for the reason the framework build above is: this Dockerfile needs DNS to
 # reach github.com, and the daemon restart in system_tune() breaks resolution
 # inside build containers for several seconds afterwards.
-if { framework_subscribes_to "latency-1m" || framework_subscribes_to "latency-10k"; } && [ -z "${ZRK_CMD:-}" ]    && ! command -v "$ZRK" >/dev/null 2>&1; then
+if { framework_subscribes_to "latency-1m" || framework_subscribes_to "latency-10k" || framework_subscribes_to "echo-10k"; } && [ -z "${ZRK_CMD:-}" ]    && ! command -v "$ZRK" >/dev/null 2>&1; then
     if ! docker image inspect "$ZRK_IMAGE" >/dev/null 2>&1; then
         info "building $ZRK_IMAGE from docker/zrk.Dockerfile (no native zrk on PATH)"
         docker build -t "$ZRK_IMAGE" -f "$ROOT_DIR/docker/zrk.Dockerfile" "$ROOT_DIR/docker"             || fail "$ZRK_IMAGE build failed — the fixed-rate profiles cannot run without it"
     fi
-    ZRK_CMD="docker run --rm --network host --cpuset-cpus=$GCANNON_CPUS --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 $ZRK_IMAGE"
+    ZRK_CMD="docker run --rm --network host --cpuset-cpus=$GCANNON_CPUS --security-opt seccomp=unconfined --ulimit memlock=-1:-1 --ulimit nofile=1048576:1048576 -v $REQUESTS_DIR:$REQUESTS_DIR:ro $ZRK_IMAGE"
     info "zrk: docker mode ($ZRK_IMAGE)"
 fi
 
@@ -270,7 +270,7 @@ run_one() {
     # three runs, which is not known until all three have happened. Every run is
     # recorded here and the choice is made below.
     local _mdir=""
-    case "$endpoint" in latency-1m|latency-10k) _mdir=$(mktemp -d) ;; esac
+    case "$endpoint" in latency-1m|latency-10k|echo-10k) _mdir=$(mktemp -d) ;; esac
 
     BEST_M=()
     local run
@@ -388,7 +388,7 @@ run_one() {
     echo ""; echo "=== Best: ${best_rps} req/s (CPU: $best_cpu, Mem: $best_mem) ==="
 
     # The fixed-rate profiles' headline number, and the check that it counts.
-    if [ "$endpoint" = "latency-1m" ] || [ "$endpoint" = "latency-10k" ]; then
+    if [ "$endpoint" = "latency-1m" ] || [ "$endpoint" = "latency-10k" ] || [ "$endpoint" = "echo-10k" ]; then
         # Two different failures that used to print the same line. "No CPU
         # reading" is a cgroup problem; "no requests" is a generator or server
         # problem, and saying the former when it is the latter sent the first
@@ -412,8 +412,24 @@ run_one() {
         fi
     fi
 
+    # echo-10k's generator reports only the bytes it read back, so that figure
+    # is the download half of the echo; the request body is a fixed size
+    # (ZRK_ECHO_BODY_BYTES in scripts/lib/tools/zrk.sh - keep the two in step),
+    # so the ingest half is that constant times rps. Without this the profile
+    # would report half the I/O it actually moves.
+    if [ "$endpoint" = "echo-10k" ] && [ "${best_rps:-0}" -gt 0 ] 2>/dev/null; then
+        BEST_M[input_bw]=$(python3 -c "
+bps = $best_rps * 10240
+if bps >= 1073741824: print(f'{bps/1073741824:.2f}GB/s')
+elif bps >= 1048576: print(f'{bps/1048576:.2f}MB/s')
+elif bps >= 1024: print(f'{bps/1024:.2f}KB/s')
+else: print(f'{bps}B/s')
+" 2>/dev/null || echo "")
+        [ -n "${BEST_M[input_bw]}" ] && info "input BW: ${BEST_M[input_bw]} (100 KB body x $best_rps rps)"
+    fi
+
     # Input bandwidth — bytes the server ingests per second. Matters for
-    # profiles where the *request* body dominates (upload fixtures) and where the response bandwidth alone
+    # profiles where the *request* body dominates and where the response bandwidth alone
     # understates the actual work done. Computed as
     #    rps × mean(--raw fixture size)
     # which is the avg bytes/request sent by gcannon. Skipped when the
@@ -488,7 +504,7 @@ save_result() {
     # not the load, so the reason ships with the row rather than being inferred
     # from an rps that looks merely slow.
     local eff_extra=""
-    if [ "$profile" = "latency-1m" ] || [ "$profile" = "latency-10k" ]; then
+    if [ "$profile" = "latency-1m" ] || [ "$profile" = "latency-10k" ] || [ "$profile" = "echo-10k" ]; then
         local _eff_reqs=${BEST_M[status_2xx]:-0}
         local _eff_per_req="null"
         if [ -n "$best_cpu_usec" ] && [ "$_eff_reqs" -gt 0 ] 2>/dev/null; then

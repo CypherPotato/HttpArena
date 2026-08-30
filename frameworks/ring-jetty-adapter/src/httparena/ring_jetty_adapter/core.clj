@@ -106,9 +106,14 @@
                  0)]
     (+ a b body)))
 
-(defn count-stream-bytes [^InputStream in]
-  (with-open [^InputStream stream in]
-    (.transferTo stream (OutputStream/nullOutputStream))))
+(defn echo-response
+  "The bytes that arrived, unchanged. Collected because the response needs a
+  Content-Length, and a chunked request carries none to forward."
+  [request]
+  (let [^InputStream in (:body request)]
+    {:status  200
+     :headers {"content-type" "application/octet-stream"}
+     :body    (if in (with-open [^InputStream s in] (.readAllBytes s)) (byte-array 0))}))
 
 (defn text-response [status body]
   {:status status
@@ -258,8 +263,8 @@
           "/fortunes" (if (= :get method)
                         (fortunes-handler request)
                         (method-not-allowed-response))
-          "/upload" (if (= :post method)
-                      (text-response 200 (str (count-stream-bytes (:body request))))
+          "/echo" (if (= :post method)
+                      (echo-response request)
                       (method-not-allowed-response))
           "/pipeline" (if (= :get method)
                         (text-response 200 "ok")

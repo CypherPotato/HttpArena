@@ -18,7 +18,6 @@
     "pipelined",
     "limited-conn",
     "json-comp",
-    "upload",
     "async-db"
   ],
   "maintainers": [

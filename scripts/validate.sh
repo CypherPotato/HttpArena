@@ -191,7 +191,7 @@ if has_test "baseline-h2" || has_test "static-h2" || has_test "baseline-h3" || h
 fi
 
 needs_h1tls=false
-if has_test "json-tls" || has_test "static-tls"; then
+if has_test "json-tls" || has_test "static-tls" || has_test "echo-10k"; then
     needs_h1tls=true
 fi
 
@@ -1501,12 +1501,18 @@ fi
 # ───── JSON Processing (GET /json) ─────
 #
 # The `json` profile was removed, but this check was not: /json/{count} is still
-# the endpoint json-comp compresses and json-h2c serves, and this is the strict
-# form of the body check - every field diffed against data/dataset.json rather
-# than only against the response's own arithmetic. json-tls runs the same check
-# against :8081 in its own block.
+# the endpoint json-comp compresses, and this is the strict form of the body
+# check - every field diffed against data/dataset.json rather than only against
+# the response's own arithmetic.
+#
+# Gated on json-comp ALONE, and deliberately not on json-h2c. This block probes
+# plaintext :8080, and an h2c-only entry has no HTTP/1.1 listener there at all -
+# actix-h2c, quarkus-jvm-h2c, vanilla-h2c, wtx-http2, zix-http2 and nginx would
+# every one of them fail a check for a port they never open. json-h2c validates
+# the same endpoint over :8082 in its own block below, and json-tls over :8081
+# in its own.
 
-if has_test "json-comp" || has_test "json-h2c"; then
+if has_test "json-comp"; then
     JSON_DOCS="$DOCS_BASE/h1/isolated/json-compressed/validation"
     echo "[test] json endpoint"
     json_fail=false
@@ -1725,75 +1731,86 @@ print(f'{count} {valid} {faithful}')
     fi
 fi
 
-# ───── Upload (POST /upload) ─────
+# ───── Echo-10K (POST /echo over TLS) ─────
+#
+# The profile loads both directions at once, so what has to be established is
+# that the bytes come back UNCHANGED - not that a count matches. Every check
+# here is byte-exact against what was sent.
+#
+# --http1.1 on every probe, and it is load-bearing. :8081 advertises ALPN h2,
+# so curl would negotiate HTTP/2 - and an echo that is broken under HTTP/1.1
+# can pass under h2. Go is the case in point: net/http drains and closes the
+# request body when response headers flush with unread body left, truncating a
+# streamed echo, while its h2 server does no such thing. wrk speaks only
+# HTTP/1.1, so validating over h2 would green-light a profile that benchmarks
+# torn responses.
 
-if has_test "upload"; then
-    UPLOAD_DOCS="$DOCS_BASE/h1/isolated/upload/validation"
-    echo "[test] upload endpoint"
-    # Small upload: returns byte count
-    UPLOAD_BODY="Hello, HttpArena!"
-    EXPECTED_LEN=${#UPLOAD_BODY}
-    check "POST /upload small body" "$EXPECTED_LEN" "$UPLOAD_DOCS" \
-        -X POST -H "Content-Type: application/octet-stream" --data-binary "$UPLOAD_BODY" \
-        "http://localhost:$PORT/upload"
+if has_test "echo-10k"; then
+    ECHO_DOCS="$DOCS_BASE/h1/isolated/echo-10k/validation"
+    tls_posture_probe "echo-10k" "$H1TLS_PORT" "$ECHO_DOCS" "http/1.1"
+    echo "[test] echo-10k endpoint"
+    echo_fail=false
 
-    # Anti-cheat: random body to detect hardcoded responses
-    RANDOM_BODY=$(head -c 64 /dev/urandom | base64 | head -c 48)
-    EXPECTED_RANDOM_LEN=${#RANDOM_BODY}
-    ACTUAL_LEN=$(curl -s --max-time 30 -X POST -H "Content-Type: application/octet-stream" --data-binary "$RANDOM_BODY" "http://localhost:$PORT/upload" || true)
-    if [ "$ACTUAL_LEN" = "$EXPECTED_RANDOM_LEN" ]; then
-        echo "  PASS [POST /upload random body] (bytes: $ACTUAL_LEN)"
-        PASS=$((PASS + 1))
-    else
-        fail_with_link "[POST /upload random body]: expected '$EXPECTED_RANDOM_LEN', got '$ACTUAL_LEN'" "$UPLOAD_DOCS"
-    fi
-
-    # Varying upload sizes
-    upload_fail=false
-    for upload_spec in "500K:512000" "2M:2097152" "10M:10485760" "20M:20971520"; do
-        upload_label="${upload_spec%%:*}"
-        upload_size="${upload_spec##*:}"
-        upload_bs=$((upload_size / 1024))
-        ACTUAL_LARGE=$( { dd if=/dev/urandom bs=1024 count=$upload_bs 2>/dev/null | curl -s --max-time 60 -X POST -H "Content-Type: application/octet-stream" --data-binary @- "http://localhost:$PORT/upload"; } || true )
-        if [ "$ACTUAL_LARGE" = "$upload_size" ]; then
-            :
+    # Random bodies, and the echo compared byte for byte. Random because a
+    # fixed one can be answered from a canned response, and the paced generator
+    # sends a single constant body -- so this is the ONLY check that makes
+    # answering without reading impossible rather than merely unlikely.
+    # 10240 is the benchmark's own size; 102400 is deliberately larger, so a
+    # handler that only works at the size it was tuned for is caught here.
+    for _sz in 1 1024 10240 102400; do
+        _src=$(mktemp); _got=$(mktemp)
+        head -c "$_sz" /dev/urandom > "$_src"
+        curl -sk --http1.1 --max-time 30 -X POST --data-binary "@$_src" \
+             -H "Content-Type: application/octet-stream" \
+             "https://localhost:$H1TLS_PORT/echo" -o "$_got" 2>/dev/null || true
+        if cmp -s "$_src" "$_got"; then
+            echo "  PASS [POST /echo ${_sz}B] (echoed byte-for-byte)"
+            PASS=$((PASS + 1))
         else
-            fail_with_link "[POST /upload $upload_label]: expected '$upload_size', got '$ACTUAL_LARGE'" "$UPLOAD_DOCS"
-            upload_fail=true
+            _gotsz=$(wc -c < "$_got" 2>/dev/null || echo 0)
+            fail_with_link "[POST /echo ${_sz}B]: expected ${_sz} bytes echoed verbatim, got ${_gotsz} bytes that differ" "$ECHO_DOCS"
+            echo_fail=true
         fi
+        rm -f "$_src" "$_got"
     done
-    if [ "$upload_fail" = "false" ]; then
-        echo "  PASS [POST /upload] (4 sizes verified: 500K, 2M, 10M, 20M)"
-        PASS=$((PASS + 1))
-    fi
 
-    # Chunked, so there is no Content-Length to echo. Every check above hands the
-    # handler a request that already states its own length in a header, which a
-    # handler that never reads the body can copy out and answer with. This one
-    # cannot be answered without counting what arrived.
-    upload_chunk_bytes=$(rand_between 100000 900000)
-    upload_chunked=$( { head -c "$upload_chunk_bytes" /dev/urandom | \
-        curl -s --max-time 60 -X POST -H "Content-Type: application/octet-stream" \
-             -H "Transfer-Encoding: chunked" --data-binary @- \
-             "http://localhost:$PORT/upload"; } || true )
-    if [ "$upload_chunked" = "$upload_chunk_bytes" ]; then
-        echo "  PASS [POST /upload chunked] ($upload_chunk_bytes bytes counted with no Content-Length)"
+    # Chunked. curl sends Transfer-Encoding: chunked when the body length is
+    # not known up front, so the server has to decode the framing rather than
+    # trust a Content-Length. This is the check the old upload profile never
+    # had: every one of its probes sent an accurate Content-Length, so a
+    # handler that echoed that header without reading a byte passed all of them.
+    for _csz in 10240 102400; do
+        _src=$(mktemp); _got=$(mktemp)
+        head -c "$_csz" /dev/urandom > "$_src"
+        cat "$_src" | curl -sk --http1.1 --max-time 30 -X POST --data-binary @- \
+             -H "Content-Type: application/octet-stream" \
+             -H "Transfer-Encoding: chunked" \
+             "https://localhost:$H1TLS_PORT/echo" -o "$_got" 2>/dev/null || true
+        if cmp -s "$_src" "$_got"; then
+            echo "  PASS [POST /echo chunked ${_csz}B] (decoded and echoed byte-for-byte)"
+            PASS=$((PASS + 1))
+        else
+            _gotsz=$(wc -c < "$_got" 2>/dev/null || echo 0)
+            fail_with_link "[POST /echo chunked ${_csz}B]: expected ${_csz} bytes echoed verbatim, got ${_gotsz} bytes that differ - the body must be read from the chunked framing, not from Content-Length" "$ECHO_DOCS"
+            echo_fail=true
+        fi
+        rm -f "$_src" "$_got"
+    done
+
+    # An empty body is still a body: the response must be a 200 with nothing in
+    # it, not a 411 or a hang.
+    _code=$(curl -sk --http1.1 --max-time 30 -o /dev/null -w '%{http_code}' -X POST --data-binary "" \
+            "https://localhost:$H1TLS_PORT/echo" 2>/dev/null || echo 000)
+    if [ "$_code" = "200" ]; then
+        echo "  PASS [POST /echo empty body] (200)"
         PASS=$((PASS + 1))
     else
-        fail_with_link "[POST /upload chunked]: sent $upload_chunk_bytes bytes with Transfer-Encoding: chunked, got '$upload_chunked' - a handler that echoes Content-Length instead of counting the body fails here" "$UPLOAD_DOCS"
+        fail_with_link "[POST /echo empty body]: expected 200, got $_code" "$ECHO_DOCS"
+        echo_fail=true
     fi
 
-    # A body shorter than the Content-Length it declares. Answering with the
-    # header's number rather than what arrived is the same shortcut seen from the
-    # other side; a server that reads the body either counts fewer bytes or
-    # refuses the request, and both are fine - echoing 4096 is not.
-    upload_short=$(printf 'short-body' | curl -s --max-time 15 -X POST \
-        -H "Content-Type: application/octet-stream" -H "Content-Length: 4096" \
-        --data-binary @- "http://localhost:$PORT/upload" 2>/dev/null || true)
-    if [ "$upload_short" = "4096" ]; then
-        fail_with_link "[POST /upload truncated body]: declared Content-Length: 4096, sent 10 bytes, and the server answered '4096' - it is reporting the header, not the body" "$UPLOAD_DOCS"
-    else
-        echo "  PASS [POST /upload truncated body] (did not echo the declared length; answered '${upload_short:-<nothing>}')"
+    if [ "$echo_fail" = "false" ]; then
+        echo "  PASS [echo-10k] (all echoes byte-exact, Content-Length and chunked)"
         PASS=$((PASS + 1))
     fi
 fi
@@ -1909,9 +1926,10 @@ if has_test "json-h2c"; then
         jm="${jp##*:}"
         resp=$(curl -s --max-time 30 --http2-prior-knowledge \
             "http://localhost:$H2C_PORT/json/$jcount?m=$jm" 2>/dev/null || true)
-        parsed=$(echo "$resp" | python3 -c "
-import sys, json
-m = $jm
+        parsed=$(echo "$resp" | JM="$jm" JCOUNT="$jcount" DATASET="$DATA_DIR/dataset.json" python3 -c "
+import sys, json, os
+m = int(os.environ['JM']); want = int(os.environ['JCOUNT'])
+source = json.load(open(os.environ['DATASET']))
 d = json.load(sys.stdin)
 count = d.get('count', -1)
 items = d.get('items', [])
@@ -1923,13 +1941,19 @@ def valid_item(it):
             and isinstance(it.get('tags'), list) and isinstance(it.get('active'), bool)
             and isinstance(r, dict) and 'score' in r and 'count' in r)
 valid = all(valid_item(it) for it in items) if items else False
-correct_totals = True
-for item in items:
-    expected = item.get('price', 0) * item.get('quantity', 0) * m
-    if item.get('total', 0) != expected:
-        correct_totals = False
-        break
-print(f'{count} {items_n} {valid} {correct_totals}')
+# Against data/dataset.json, not the response's own arithmetic: a made-up item
+# with a self-consistent total would otherwise pass.
+faithful = items_n == want
+if faithful:
+    for got, src in zip(items, source[:want]):
+        if (got.get('id') != src['id'] or got.get('name') != src['name']
+                or got.get('category') != src['category'] or got.get('price') != src['price']
+                or got.get('quantity') != src['quantity'] or got.get('active') != src['active']
+                or got.get('tags') != src['tags']
+                or got.get('total') != src['price'] * src['quantity'] * m):
+            faithful = False
+            break
+print(f'{count} {items_n} {valid} {faithful}')
 " 2>/dev/null || echo "-1 -1 False False")
         pc=$(echo "$parsed" | cut -d' ' -f1)
         pn=$(echo "$parsed" | cut -d' ' -f2)

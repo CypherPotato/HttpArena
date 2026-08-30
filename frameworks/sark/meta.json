@@ -11,7 +11,7 @@
     "pipelined",
     "limited-conn",
     "json-comp",
-    "upload",
+    "echo-10k",
     "async-db",
     "fortunes",
     "json-tls",

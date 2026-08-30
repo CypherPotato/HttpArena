@@ -19,7 +19,7 @@
     "pipelined",
     "json-comp",
     "json-tls",
-    "upload",
+    "echo-10k",
     "static-tls",
     "async-db",
     "baseline-h2",
@@ -27,9 +27,7 @@
     "baseline-h2c",
     "json-h2c",
     "echo-ws",
-    "echo-ws-pipeline",
-    "fortunes"
-  ],
+    "echo-ws-pipeline"],
   "maintainers": [
     "bjhham",
     "juanchurtado1991"
